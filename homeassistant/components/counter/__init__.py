@@ -1,5 +1,6 @@
 """Component to count within automations."""
 
+from collections.abc import Callable
 import logging
 from typing import Any, Self, override
 
@@ -12,6 +13,7 @@ from homeassistant.const import (
     CONF_MINIMUM,
     CONF_NAME,
     EVENT_HOMEASSISTANT_STARTED,
+    STATE_ON,
 )
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers import collection, config_validation as cv
@@ -37,6 +39,8 @@ CONF_STEP = "step"
 CONF_ENHANCED_MODE = "enhanced_mode"
 CONF_TIMER_ENTITY = "timer_entity"
 CONF_SCHEDULE_ENTITY = "schedule_entity"
+
+EVENT_TIMER_FINISHED = "timer.finished"
 
 DEFAULT_INITIAL = 0
 DEFAULT_STEP = 1
@@ -200,6 +204,8 @@ class Counter(collection.CollectionEntity, RestoreEntity):
         """Initialize a counter."""
         self._config: ConfigType = config
         self._state: int | None = config[CONF_INITIAL]
+        self._automatic_turns = 0
+        self._unsub_timer_finished: Callable[[], None] | None = None
 
     @classmethod
     @override
@@ -240,7 +246,7 @@ class Counter(collection.CollectionEntity, RestoreEntity):
     @override
     def extra_state_attributes(self) -> dict:
         """Return the state attributes."""
-        ret = {
+        ret: dict[str, Any] = {
             CounterEntityStateAttribute.EDITABLE: self.editable,
             CounterEntityStateAttribute.INITIAL: self._config[CONF_INITIAL],
             CounterEntityStateAttribute.STEP: self._config[CONF_STEP],
@@ -252,6 +258,8 @@ class Counter(collection.CollectionEntity, RestoreEntity):
         if self._config[CONF_MAXIMUM] is not None:
             ret[CounterEntityStateAttribute.MAXIMUM] = self._config[CONF_MAXIMUM]
 
+        if self._config.get(CONF_ENHANCED_MODE, False):
+            ret["automatic_turns"] = self._automatic_turns
         return ret
 
     @property
@@ -290,6 +298,41 @@ class Counter(collection.CollectionEntity, RestoreEntity):
 
         return state
 
+    @callback
+    def _unsubscribe_timer_finished(self) -> None:
+        """Remove a previous Timer listener, if present."""
+        if self._unsub_timer_finished is not None:
+            self._unsub_timer_finished()
+            self._unsub_timer_finished = None
+
+    @callback
+    def _subscribe_timer_finished(self) -> None:
+        """Listen only when Enhanced Mode and a Timer are configured."""
+        self._unsubscribe_timer_finished()
+        if not self._config.get(CONF_ENHANCED_MODE, False):
+            return
+        if not self._config.get(CONF_TIMER_ENTITY):
+            return
+
+        self._unsub_timer_finished = self.hass.bus.async_listen(
+            EVENT_TIMER_FINISHED, self._handle_timer_finished
+        )
+
+    @callback
+    def _handle_timer_finished(self, event: Event[dict[str, Any]]) -> None:
+        """Increment only for the selected Timer and an allowed Schedule."""
+        if not self._config.get(CONF_ENHANCED_MODE, False):
+            return
+        if event.data.get("entity_id") != self._config.get(CONF_TIMER_ENTITY):
+            return
+
+        schedule_entity = self._config.get(CONF_SCHEDULE_ENTITY)
+        if schedule_entity and not self.hass.states.is_state(schedule_entity, STATE_ON):
+            return
+
+        self._automatic_turns += 1
+        self.async_increment()
+
     @override
     async def async_added_to_hass(self) -> None:
         """Call when entity about to be added to Home Assistant."""
@@ -302,6 +345,12 @@ class Counter(collection.CollectionEntity, RestoreEntity):
             and (state := await self.async_get_last_state()) is not None
         ):
             self._state = self.compute_next_state(int(state.state))
+            saved_turns = state.attributes.get("automatic_turns")
+            if type(saved_turns) is int and saved_turns >= 0:
+                self._automatic_turns = saved_turns
+
+        self.async_on_remove(self._unsubscribe_timer_finished)
+        self._subscribe_timer_finished()
 
     @callback
     def async_decrement(self) -> None:
@@ -355,3 +404,4 @@ class Counter(collection.CollectionEntity, RestoreEntity):
         self._config = config
         self._state = self.compute_next_state(self._state)
         self.async_write_ha_state()
+        self._subscribe_timer_finished()
