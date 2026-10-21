@@ -11,8 +11,9 @@ from homeassistant.const import (
     CONF_MAXIMUM,
     CONF_MINIMUM,
     CONF_NAME,
+    EVENT_HOMEASSISTANT_STARTED,
 )
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers import collection, config_validation as cv
 from homeassistant.helpers.entity_component import EntityComponent
 from homeassistant.helpers.restore_state import RestoreEntity
@@ -32,6 +33,10 @@ VALUE = "value"
 CONF_INITIAL = "initial"
 CONF_RESTORE = "restore"
 CONF_STEP = "step"
+
+CONF_ENHANCED_MODE = "enhanced_mode"
+CONF_TIMER_ENTITY = "timer_entity"
+CONF_SCHEDULE_ENTITY = "schedule_entity"
 
 DEFAULT_INITIAL = 0
 DEFAULT_STEP = 1
@@ -55,6 +60,9 @@ STORAGE_FIELDS: VolDictType = {
     vol.Optional(CONF_MINIMUM, default=None): vol.Any(None, vol.Coerce(int)),
     vol.Optional(CONF_RESTORE, default=True): cv.boolean,
     vol.Optional(CONF_STEP, default=DEFAULT_STEP): cv.positive_int,
+    vol.Optional(CONF_ENHANCED_MODE): cv.boolean,
+    vol.Optional(CONF_TIMER_ENTITY): vol.Any(None, cv.entity_id),
+    vol.Optional(CONF_SCHEDULE_ENTITY): vol.Any(None, cv.entity_id),
 }
 
 
@@ -83,6 +91,9 @@ CONFIG_SCHEMA = vol.Schema(
                     ),
                     vol.Optional(CONF_RESTORE, default=True): cv.boolean,
                     vol.Optional(CONF_STEP, default=DEFAULT_STEP): cv.positive_int,
+                    vol.Optional(CONF_ENHANCED_MODE): cv.boolean,
+                    vol.Optional(CONF_TIMER_ENTITY): vol.Any(None, cv.entity_id),
+                    vol.Optional(CONF_SCHEDULE_ENTITY): vol.Any(None, cv.entity_id),
                 },
             )
         )
@@ -128,6 +139,30 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         {vol.Required(VALUE): vol.Coerce(int)},
         "async_set_value",
     )
+
+    @callback
+    def _register_task_rotation_panel(_event: Event | None = None) -> None:
+        """Expose the frontend Task Rotation demo after frontend setup."""
+        from homeassistant.components import frontend  # noqa: PLC0415
+
+        if "frontend" not in hass.config.components:
+            return
+        if "task-rotation" in hass.data.get(frontend.DATA_PANELS, {}):
+            return
+        frontend.async_register_built_in_panel(
+            hass,
+            component_name="task-rotation",
+            sidebar_title="Task Rotation",
+            sidebar_icon="mdi:clipboard-check",
+            frontend_url_path="task-rotation",
+        )
+
+    if hass.is_running:
+        _register_task_rotation_panel()
+    else:
+        hass.bus.async_listen_once(
+            EVENT_HOMEASSISTANT_STARTED, _register_task_rotation_panel
+        )
 
     return True
 
@@ -210,10 +245,13 @@ class Counter(collection.CollectionEntity, RestoreEntity):
             CounterEntityStateAttribute.INITIAL: self._config[CONF_INITIAL],
             CounterEntityStateAttribute.STEP: self._config[CONF_STEP],
         }
+
         if self._config[CONF_MINIMUM] is not None:
             ret[CounterEntityStateAttribute.MINIMUM] = self._config[CONF_MINIMUM]
+
         if self._config[CONF_MAXIMUM] is not None:
             ret[CounterEntityStateAttribute.MAXIMUM] = self._config[CONF_MAXIMUM]
+
         return ret
 
     @property
@@ -226,8 +264,29 @@ class Counter(collection.CollectionEntity, RestoreEntity):
         """Keep the state within the range of min/max values."""
         if self._config[CONF_MINIMUM] is not None:
             state = max(self._config[CONF_MINIMUM], state)
+
         if self._config[CONF_MAXIMUM] is not None:
             state = min(self._config[CONF_MAXIMUM], state)
+
+        return state
+
+    def compute_next_step_state(self, state: int) -> int | None:
+        """Wrap counter steps when enhanced mode is enabled."""
+        minimum = self._config[CONF_MINIMUM]
+        maximum = self._config[CONF_MAXIMUM]
+
+        if (
+            not self._config.get(CONF_ENHANCED_MODE, False)
+            or minimum is None
+            or maximum is None
+        ):
+            return self.compute_next_state(state)
+
+        if state > maximum:
+            return int(minimum)
+
+        if state < minimum:
+            return int(maximum)
 
         return state
 
@@ -235,6 +294,7 @@ class Counter(collection.CollectionEntity, RestoreEntity):
     async def async_added_to_hass(self) -> None:
         """Call when entity about to be added to Home Assistant."""
         await super().async_added_to_hass()
+
         # __init__ will set self._state to self._initial, only override
         # if needed.
         if (
@@ -245,14 +305,18 @@ class Counter(collection.CollectionEntity, RestoreEntity):
 
     @callback
     def async_decrement(self) -> None:
-        """Decrement the counter."""
-        self._state = self.compute_next_state(self._state - self._config[CONF_STEP])
+        """Decrement the counter, wrapping in enhanced mode."""
+        self._state = self.compute_next_step_state(
+            self._state - self._config[CONF_STEP]
+        )
         self.async_write_ha_state()
 
     @callback
     def async_increment(self) -> None:
-        """Increment a counter."""
-        self._state = self.compute_next_state(self._state + self._config[CONF_STEP])
+        """Increment the counter, wrapping in enhanced mode."""
+        self._state = self.compute_next_step_state(
+            self._state + self._config[CONF_STEP]
+        )
         self.async_write_ha_state()
 
     @callback
